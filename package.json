@@ -40,6 +40,7 @@
   "files": [
     "build-out/wtf_node_js_compiled.js",
     "bin/",
+    "bin/cpp_src/",
     "docs/",
     "extensions/wtf-instrument-proxy/",
     "AUTHORS",
@@ -51,6 +52,7 @@
     "wtf-controller": "./bin/controller.js",
     "wtf-diff": "./bin/diff.js",
     "wtf-dump": "./bin/dump.js",
+    "wtf-generate-webgl-app": "./bin/generate-webgl-app.js",
     "wtf-instrument": "./bin/instrument.js",
     "wtf-query": "./bin/query.js",
     "wtf-trace": "./bin/trace-runner.js",
