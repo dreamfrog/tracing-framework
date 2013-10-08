@@ -19,10 +19,15 @@ var fs = require('fs');
 var optimist = require('optimist');
 var os = require('os');
 var path = require('path');
+var tmp = require('temporary');
 
 var toolRunner = require('./tool-runner');
 var util = toolRunner.util;
 toolRunner.launch(runTool);
+
+
+var modulePath = path.dirname(module.filename);
+var templatePath = path.join(modulePath, 'cpp_src');
 
 
 function runTool(platform, args, done) {
@@ -127,11 +132,8 @@ BinFile.prototype.write = function(data) {
  * @param {function(number)} done Done callback. 0 for success.
  */
 function processDatabase(argv, outputBaseFile, db, done) {
-  var modulePath = path.dirname(module.filename);
-  var templatePath = path.join(modulePath, 'cpp_src');
   var templates = {
-    header: fs.readFileSync(path.join(templatePath, 'webgl-header.cc'), 'utf8'),
-    footer: fs.readFileSync(path.join(templatePath, 'webgl-footer.cc'), 'utf8')
+    header: fs.readFileSync(path.join(templatePath, 'webgl-header.cc'), 'utf8')
   };
 
   var zones = db.getZones();
@@ -154,58 +156,83 @@ function processDatabase(argv, outputBaseFile, db, done) {
   var binFile = new BinFile(outputBaseFile + '.bin');
 
   console.log("Generating code...");
-  var output = [];
-
-  // Add header.
-  output.push(templates.header);
+  var tempDirObj = new tmp.Dir();
+  var tempDir = tempDirObj.path;
+  process.on('exit', function() {
+    tempDirObj.rmdir();
+  });
 
   // Add all steps.
+  var ccFiles = [];
   for (var n = 0; n < steps.length; n++) {
     var step = steps[n];
+
+    // Prep file.
+    var output = [];
+    output.push(templates.header);
+
+    // Add step function.
     output.push('void step_' + n + '(Replay* replay) {');
     addStep(eventList, n, step, output, binFile);
     output.push('}');
+
+    // Flush.
+    var finalOutput = output.join(os.EOL);
+    var ccFile = path.basename(outputBaseFile) + '_step_' + n + '.cc';
+    ccFile = path.join(tempDir, ccFile);
+    fs.writeFileSync(ccFile, finalOutput);
+    ccFiles.push(ccFile);
   }
+
+  // Build statics file.
+  var output = [];
+  output.push(templates.header);
 
   // Add step list variable.
   var stepFnList = [];
   for (var n = 0; n < steps.length; n++) {
     stepFnList.push('step_' + n + ',');
+    output.push('extern void step_' + n + '(Replay* replay);');
   }
   output.push(
-      'static const StepFunction steps[] = { ' + stepFnList.join(' ') + ' };');
+      'StepFunction __steps[] = { ' + stepFnList.join(' ') + ' };');
+  output.push(
+      'int __step_count = ' + stepFnList.length + ';');
+  output.push('StepFunction* __get_steps() { return __steps; }');
 
   // Static info.
   output.push(
-      'static const char* trace_name = "' +
+      'const char* __trace_name = "' +
           path.basename(outputBaseFile) + '";');
   output.push(
-      'static const char* bin_name = "' +
+      'const char* __bin_name = "' +
           path.basename(outputBaseFile) + '.bin";');
-
-  // Add footer.
-  output.push(templates.footer);
 
   // Write output cc file.
   console.log("Writing .cc file...");
   var finalOutput = output.join(os.EOL);
-  fs.writeFileSync(outputBaseFile + '.cc', finalOutput);
+  var ccFile = path.join(tempDir, path.basename(outputBaseFile) + '.cc');
+  fs.writeFileSync(ccFile, finalOutput);
+  ccFiles.push(ccFile);
 
   // Finish bin file.
   binFile.dispose();
 
   // Build!
   console.log("Building executable...");
-  build(outputBaseFile, done);
+  build(outputBaseFile, ccFiles, done);
 };
 
 
 /**
  * Builds a native app.
  * @param {string} outputBaseFile Base filename for output (without extension).
+ * @param {!Array.<string>} ccFiles A list of input .cc files.
  * @param {function(number)} done Done callback. 0 for success.
  */
-function build(outputBaseFile, done) {
+function build(outputBaseFile, ccFiles, done) {
+  ccFiles.push(path.join(templatePath, 'webgl-main.cc'));
+
   switch (os.platform()) {
     case 'linux':
       buildWithGcc();
@@ -216,31 +243,37 @@ function build(outputBaseFile, done) {
   }
 
   function buildWithGcc() {
-    var sourceFiles = [
-      outputBaseFile + '.cc'
-    ];
     var outputFile = outputBaseFile;
 
     // Build base command line for G++.
     var commandLine = [
-      'g++',
-      '-o ' + outputFile,
-      sourceFiles.join(' '),
-      '-std=c++0x',
-      '-L/usr/local/lib',
-      '-Wl,-rpath,/usr/local/lib',
-      '-lm -lSDL2 -lpthread -lGL -ldl -lrt',
-      '-I/usr/local/include/SDL2',
-      '-D_REENTRANT'
+      'CXXFLAGS="' + [
+        '-std=c++0x',
+        '-I' + templatePath,
+        '-L/usr/local/lib',
+        '-Wl,-rpath,/usr/local/lib',
+        '-lm -lSDL2 -lpthread -lGL -ldl -lrt',
+        '-I/usr/local/include/SDL2',
+        '-D_REENTRANT',
+      ].join(' ') + '"',
+      'LDFLAGS="' + [
+        '-o ' + outputFile,
+        '-L/usr/local/lib',
+        '-lm -lSDL2 -lpthread -lGL -ldl -lrt',
+      ].join(' ') + '"',
+      'make',
+      '-f ' + templatePath + '/Makefile',
+      '-j 16',
+      'src="' + ccFiles.join(' ') + '"'
     ];
 
     // Build!
     child_process.exec(
         commandLine.join(' '), {
         }, function(error, stdout, stderr) {
-          console.log(stdout);
-          console.log(stderr);
           if (error !== null) {
+            console.log(stdout);
+            console.log(stderr);
             console.log(error);
             done(1);
           } else {
@@ -268,7 +301,9 @@ function addStep(eventList, stepIndex, step, output, binFile) {
   }
 
   // Walk events.
+  var n = 0;
   for (var it = step.getEventIterator(true); !it.done(); it.next()) {
+    n++;
     var handler = CALLS[it.getName()];
     if (handler) {
       var args = it.getArguments();
