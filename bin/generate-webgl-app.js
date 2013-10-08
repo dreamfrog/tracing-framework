@@ -68,6 +68,57 @@ function runTool(platform, args, done) {
 };
 
 
+
+/**
+ * Binary file wrapper.
+ * @param {string} path File path.
+ * @constructor
+ */
+var BinFile = function(path) {
+  /**
+   * File handle.
+   * @type {number}
+   * @private
+   */
+  this.fd_ = fs.openSync(path, 'w');
+
+  /**
+   * Current offset into the file.
+   * @type {number}
+   * @private
+   */
+  this.offset_ = 0;
+};
+
+
+/**
+ * Closes the file and disposes resources.
+ */
+BinFile.prototype.dispose = function() {
+  fs.closeSync(this.fd_);
+};
+
+
+/**
+ * Writes data to the file.
+ * @param {!ArrayBufferView} data Array buffer data.
+ * @return {number} Offset in the file the data was written to.
+ */
+BinFile.prototype.write = function(data) {
+  var buffer = new Buffer(data.byteLength);
+  var byteData =
+      data instanceof Uint8Array ? data : new Uint8Array(data.buffer);
+  for (var n = 0; n < byteData.length; n++) {
+    buffer[n] = byteData[n];
+  }
+
+  var offset = this.offset_;
+  fs.writeSync(this.fd_, buffer, 0, buffer.length, this.offset_);
+  this.offset_ += buffer.length;
+  return offset;
+};
+
+
 /**
  * Processes a loaded database.
  * @param {!Object} argv Parsed optimist arguments.
@@ -94,10 +145,15 @@ function processDatabase(argv, outputBaseFile, db, done) {
   var zone = zones[0];
 
   // Build a step list.
+  console.log("Building step list...");
   var eventList = zone.getEventList();
   var frameList = zone.getFrameList();
   var steps = wtf.replay.graphics.Step.constructStepsList(eventList, frameList);
 
+  // Open bin file.
+  var binFile = new BinFile(outputBaseFile + '.bin');
+
+  console.log("Generating code...");
   var output = [];
 
   // Add header.
@@ -107,7 +163,7 @@ function processDatabase(argv, outputBaseFile, db, done) {
   for (var n = 0; n < steps.length; n++) {
     var step = steps[n];
     output.push('void step_' + n + '(Replay* replay) {');
-    addStep(eventList, n, step, output);
+    addStep(eventList, n, step, output, binFile);
     output.push('}');
   }
 
@@ -123,15 +179,23 @@ function processDatabase(argv, outputBaseFile, db, done) {
   output.push(
       'static const char* trace_name = "' +
           path.basename(outputBaseFile) + '";');
+  output.push(
+      'static const char* bin_name = "' +
+          path.basename(outputBaseFile) + '.bin";');
 
   // Add footer.
   output.push(templates.footer);
 
   // Write output cc file.
+  console.log("Writing .cc file...");
   var finalOutput = output.join(os.EOL);
   fs.writeFileSync(outputBaseFile + '.cc', finalOutput);
 
+  // Finish bin file.
+  binFile.dispose();
+
   // Build!
+  console.log("Building executable...");
   build(outputBaseFile, done);
 };
 
@@ -187,7 +251,7 @@ function build(outputBaseFile, done) {
 };
 
 
-function addStep(eventList, stepIndex, step, output) {
+function addStep(eventList, stepIndex, step, output, binFile) {
   // Locals used by generators.
   output.push('GLubyte scratch_data[2048];');
   output.push('GLuint id;');
@@ -208,7 +272,7 @@ function addStep(eventList, stepIndex, step, output) {
     var handler = CALLS[it.getName()];
     if (handler) {
       var args = it.getArguments();
-      handler(it, args, output);
+      handler(it, args, output, binFile);
       output.push('CHECK_GL();');
     } else {
       var eventString = it.getLongString().replace(/\n/g, ' ');
@@ -219,24 +283,39 @@ function addStep(eventList, stepIndex, step, output) {
 };
 
 
-function arrayToString(v) {
-  var values = Array.prototype.join.call(v, ', ');
+var ENABLE_BIN_FILE = true;
+var ONLY_LARGE_BIN_DATA = true;
+function embedArray(v, binFile) {
+  var targetType;
   if (v instanceof Int8Array) {
-    return '(const GLbyte[]){' + values + '}';
+    targetType = 'GLbyte';
   } else if (v instanceof Uint8Array) {
-    return '(const GLubyte[]){' + values + '}';
+    targetType = 'GLubyte';
   } else if (v instanceof Int16Array) {
-    return '(const GLshort[]){' + values + '}';
+    targetType = 'GLshort';
   } else if (v instanceof Uint16Array) {
-    return '(const GLushort[]){' + values + '}';
+    targetType = 'GLushort';
   } else if (v instanceof Int32Array) {
-    return '(const GLint[]){' + values + '}';
+    targetType = 'GLint';
   } else if (v instanceof Uint32Array) {
-    return '(const GLuint[]){' + values + '}';
+    targetType = 'GLuint';
   } else if (v instanceof Float32Array) {
-    return '(const GLfloat[]){' + values + '}';
+    targetType = 'GLfloat';
   } else {
-    return 'UNKNOWN_TYPE_IN_ARRAY_TO_STRING';
+    targetType = 'GLvoid';
+  }
+
+  // If the data is over 16*4b (the size of a mat4x4), place in the bin file.
+  if (ENABLE_BIN_FILE &&
+      (!ONLY_LARGE_BIN_DATA || v.byteLength > 16 * 4)) {
+    // Bin file.
+    var offset = binFile.write(v);
+    return '(const ' + targetType + '*)' + '(replay->GetBinData(' +
+        offset + ', ' + v.byteLength + '))';
+  } else {
+    // Directly embed.
+    var values = Array.prototype.join.call(v, ', ');
+    return '(const ' + targetType + '[])' + '{' + values + '}';
   }
 };
 
@@ -248,20 +327,20 @@ function arrayToString(v) {
  */
 var CALLS = {
   'WebGLRenderingContext#attachShader': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glAttachShader(' + [
       'context->GetObject(' + args['program'] + ')',
       'context->GetObject(' + args['shader'] + ')'
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#activeTexture': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glActiveTexture(' + [
       args['texture']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#bindAttribLocation': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glBindAttribLocation(' + [
       'context->GetObject(' + args['program'] + ')',
       args['index'],
@@ -269,65 +348,65 @@ var CALLS = {
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#bindBuffer': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glBindBuffer(' + [
       args['target'],
       'context->GetObject(' + args['buffer'] + ')'
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#bindFramebuffer': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glBindFramebuffer(' + [
       args['target'],
       'context->GetObject(' + args['framebuffer'] + ')'
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#bindRenderbuffer': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glBindRenderbuffer(' + [
       args['target'],
       'context->GetObject(' + args['renderbuffer'] + ')'
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#bindTexture': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glBindTexture(' + [
       args['target'],
       'context->GetObject(' + args['texture'] + ')'
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#blendColor': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glBlendColor(' + [
       args['red'], args['green'], args['blue'], args['alpha']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#blendEquation': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glBlendEquation(' + [
       args['mode']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#blendEquationSeparate': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glBlendEquationSeparate(' + [
       args['modeRGB'], args['modeAlpha']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#blendFunc': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glBlendFunc(' + [
       args['sfactor'], args['dfactor']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#blendFuncSeparate': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glBlendFuncSeparate(' + [
       args['srcRGB'], args['dstRGB'], args['srcAlpha'], args['dstAlpha']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#bufferData': function(
-      it, args, output) {
+      it, args, output, binFile) {
     var data = args['data'];
     var empty = false;
     if (!data || data.byteLength != args['size']) {
@@ -337,83 +416,83 @@ var CALLS = {
     output.push('glBufferData(' + [
       args['target'],
       args['size'],
-      empty ? '0' : arrayToString(data),
+      empty ? '0' : embedArray(data, binFile),
       args['usage']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#bufferSubData': function(
-      it, args, output) {
+      it, args, output, binFile) {
     var data = args['data'];
     output.push('glBufferSubData(' + [
       args['target'],
       args['offset'],
       data.byteLength,
-      arrayToString(data)
+      embedArray(data, binFile)
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#checkFramebufferStatus': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glCheckFramebufferStatus(' + [
       args['target']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#clear': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glClear(' + [
       args['mask']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#clearColor': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glClearColor(' + [
       args['red'], args['green'], args['blue'], args['alpha']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#clearDepth': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glClearDepth(' + [
       args['depth']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#clearStencil': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glClearStencil(' + [
       args['s']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#colorMask': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glColorMask(' + [
       args['red'], args['green'], args['blue'], args['alpha']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#compileShader': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glCompileShader(' + [
       'context->GetObject(' + args['shader'] + ')'
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#compressedTexImage2D': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glCompressedTexImage2D(' + [
       args['target'], args['level'], args['internalformat'],
       args['width'], args['height'], args['border'],
       args['data'].byteLength,
-      '(const GLvoid*)' + arrayToString(args['data'])
+      '(const GLvoid*)' + embedArray(args['data'], binFile)
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#compressedTexSubImage2D': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glCompressedTexSubImage2D(' + [
       args['target'], args['level'], args['xoffset'],
       args['yoffset'], args['width'], args['height'],
       args['format'],
       args['data'].byteLength,
-      '(const GLvoid*)' + arrayToString(args['data'])
+      '(const GLvoid*)' + embedArray(args['data'], binFile)
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#copyTexImage2D': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glCopyTexImage2D(' + [
       args['target'], args['level'], args['internalformat'],
       args['x'], args['y'], args['width'],
@@ -421,7 +500,7 @@ var CALLS = {
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#copyTexSubImage2D': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glCopyTexSubImage2D(' + [
       args['target'], args['level'], args['xoffset'],
       args['yoffset'], args['x'], args['y'],
@@ -429,110 +508,110 @@ var CALLS = {
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#createBuffer': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glGenBuffers(1, &id);');
     output.push('context->SetObject(' + args['buffer'] + ', id);');
   },
   'WebGLRenderingContext#createFramebuffer': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glGenFramebuffers(1, &id);');
     output.push('context->SetObject(' + args['framebuffer'] + ', id);');
   },
   'WebGLRenderingContext#createRenderbuffer': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glGenRenderbuffers(1, &id);');
     output.push('context->SetObject(' + args['renderbuffer'] + ', id);');
   },
   'WebGLRenderingContext#createTexture': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glGenTextures(1, &id);');
     output.push('context->SetObject(' + args['texture'] + ', id);');
   },
   'WebGLRenderingContext#createProgram': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('id = glCreateProgram();');
     output.push('context->SetObject(' + args['program'] + ', id);');
   },
   'WebGLRenderingContext#createShader': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('id = glCreateShader(' + args['type'] + ');');
     output.push('context->SetObject(' + args['shader'] + ', id);');
   },
   'WebGLRenderingContext#cullFace': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glCullFace(' + [
       args['mode']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#deleteBuffer': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('id = context->GetObject(' + args['buffer'] + ');');
     output.push('glDeleteBuffers(1, &id);');
   },
   'WebGLRenderingContext#deleteFramebuffer': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('id = context->GetObject(' + args['framebuffer'] + ');');
     output.push('glDeleteFramebuffers(1, &id);');
   },
   'WebGLRenderingContext#deleteProgram': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('id = context->GetObject(' + args['program'] + ');');
     output.push('glDeleteProgram(id);');
   },
   'WebGLRenderingContext#deleteRenderbuffer': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('id = context->GetObject(' + args['renderbuffer'] + ');');
     output.push('glDeleteRenderbuffer(1, &id);');
   },
   'WebGLRenderingContext#deleteShader': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('id = context->GetObject(' + args['shader'] + ');');
     output.push('glDeleteShader(id);');
   },
   'WebGLRenderingContext#deleteTexture': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('id = context->GetObject(' + args['texture'] + ');');
     output.push('glDeleteTextures(1, &id);');
   },
   'WebGLRenderingContext#depthFunc': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glDepthFunc(' + [
       args['func']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#depthMask': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glDepthMask(' + [
       args['flag']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#depthRange': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glDepthRange(' + [
       args['zNear'], args['zFar']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#detachShader': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glDetachShader(' + [
       'context->GetObject(' + args['program'] + ')',
       'context->GetObject(' + args['shader'] + ')'
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#disable': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glDisable(' + [
       args['cap']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#disableVertexAttribArray': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glDisableVertexAttribArray(' + [
       args['index']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#drawArrays': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glDrawArrays(' + [
       args['mode'],
       args['first'],
@@ -540,7 +619,7 @@ var CALLS = {
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#drawElements': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glDrawElements(' + [
       args['mode'],
       args['count'],
@@ -549,23 +628,23 @@ var CALLS = {
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#enable': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glEnable(' + args['cap'] + ');');
   },
   'WebGLRenderingContext#enableVertexAttribArray': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glEnableVertexAttribArray(' + args['index'] + ');');
   },
   'WebGLRenderingContext#finish': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glFinish();');
   },
   'WebGLRenderingContext#flush': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glFlush();');
   },
   'WebGLRenderingContext#framebufferRenderbuffer': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glFramebufferRenderbuffer(' + [
       args['target'],
       args['attachment'],
@@ -574,7 +653,7 @@ var CALLS = {
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#framebufferTexture2D': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glFramebufferTexture2D(' + [
       args['target'],
       args['attachment'],
@@ -584,41 +663,41 @@ var CALLS = {
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#frontFace': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glFrontFace(' + [
       args['mode']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#generateMipmap': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glGenerateMipmap(' + [
       args['target']
     ].join(', ') + ');');
   },
   // 'WebGLRenderingContext#getActiveAttrib': function(
-  //     it, args, output) {
+  //     it, args, output, binFile) {
   //   // TODO(chizeng): modify playback to make it work with varying locations.
   //   gl.getActiveAttrib(
   //       /** @type {WebGLProgram} */ (objs[args['program']]), args['index']);
   // },
   // 'WebGLRenderingContext#getActiveUniform': function(
-  //     it, args, output) {
+  //     it, args, output, binFile) {
   //   // maybe we must modify playback to obtain the new active uniform.
   //   gl.getActiveUniform(
   //       /** @type {WebGLProgram} */ (objs[args['program']]), args['index']);
   // },
   // 'WebGLRenderingContext#getAttachedShaders': function(
-  //     it, args, output) {
+  //     it, args, output, binFile) {
   //   gl.getAttachedShaders(
   //       /** @type {WebGLProgram} */ (objs[args['program']]));
   // },
   // 'WebGLRenderingContext#getAttribLocation': function(
-  //     it, args, output) {
+  //     it, args, output, binFile) {
   //   gl.getAttribLocation(
   //       /** @type {WebGLProgram} */ (objs[args['program']]), args['name']);
   // },
   'WebGLRenderingContext#getBufferParameter': function(
-      it, args, output) {
+      it, args, output, binFile) {
     gl.getBufferParameter(
         args['target'], args['pname']);
     output.push('glGetBufferParameteriv(' + [
@@ -628,11 +707,11 @@ var CALLS = {
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#getError': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glGetError();');
   },
   // 'WebGLRenderingContext#getExtension': function(
-  //     it, args, output) {
+  //     it, args, output, binFile) {
   //   // TODO(chizeng): Possibly store the extension?
   //   var originalExtension = args['name'];
   //   var relatedExtension =
@@ -640,62 +719,62 @@ var CALLS = {
   //   gl.getExtension(relatedExtension || originalExtension);
   // },
   // 'WebGLRenderingContext#getParameter': function(
-  //     it, args, output) {
+  //     it, args, output, binFile) {
   //   gl.getParameter(args['pname']);
   // },
   // 'WebGLRenderingContext#getFramebufferAttachmentParameter': function(
-  //     it, args, output) {
+  //     it, args, output, binFile) {
   //   gl.getFramebufferAttachmentParameter(
   //       args['target'], args['attachment'], args['pname']);
   // },
   // 'WebGLRenderingContext#getProgramParameter': function(
-  //     it, args, output) {
+  //     it, args, output, binFile) {
   //   gl.getProgramParameter(
   //       /** @type {WebGLProgram} */ (objs[args['program']]), args['pname']);
   // },
   // 'WebGLRenderingContext#getProgramInfoLog': function(
-  //     it, args, output) {
+  //     it, args, output, binFile) {
   //   gl.getProgramInfoLog(
   //       /** @type {WebGLProgram} */ (objs[args['program']]));
   // },
   // 'WebGLRenderingContext#getRenderbufferParameter': function(
-  //     it, args, output) {
+  //     it, args, output, binFile) {
   //   gl.getRenderbufferParameter(
   //       args['target'], args['pname']);
   // },
   // 'WebGLRenderingContext#getShaderParameter': function(
-  //     it, args, output) {
+  //     it, args, output, binFile) {
   //   gl.getShaderParameter(
   //       /** @type {WebGLShader} */ (objs[args['shader']]), args['pname']);
   // },
   // 'WebGLRenderingContext#getShaderPrecisionFormat': function(
-  //     it, args, output) {
+  //     it, args, output, binFile) {
   //   gl.getShaderPrecisionFormat(
   //       args['shadertype'], args['precisiontype']);
   // },
   // 'WebGLRenderingContext#getShaderInfoLog': function(
-  //     it, args, output) {
+  //     it, args, output, binFile) {
   //   gl.getShaderInfoLog(
   //       /** @type {WebGLShader} */ (objs[args['shader']]));
   // },
   // 'WebGLRenderingContext#getShaderSource': function(
-  //     it, args, output) {
+  //     it, args, output, binFile) {
   //   gl.getShaderSource(
   //       /** @type {WebGLShader} */ (objs[args['shader']]));
   // },
   // 'WebGLRenderingContext#getTexParameter': function(
-  //     it, args, output) {
+  //     it, args, output, binFile) {
   //   gl.getTexParameter(
   //       args['target'], args['pname']);
   // },
   // 'WebGLRenderingContext#getUniform': function(
-  //     it, args, output) {
+  //     it, args, output, binFile) {
   //   gl.getUniform(
   //       /** @type {WebGLProgram} */ (objs[args['program']]),
   //       /** @type {WebGLUniformLocation} */ (objs[args['location']]));
   // },
   'WebGLRenderingContext#getUniformLocation': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('id = glGetUniformLocation(' + [
       'context->GetObject(' + args['program'] + ')',
       '"' + args['name'] + '"'
@@ -703,71 +782,71 @@ var CALLS = {
     output.push('context->SetObject(' + args['value'] + ', id);');
   },
   // 'WebGLRenderingContext#getVertexAttrib': function(
-  //     it, args, output) {
+  //     it, args, output, binFile) {
   //   gl.getVertexAttrib(
   //       args['index'], args['pname']);
   // },
   // 'WebGLRenderingContext#getVertexAttribOffset': function(
-  //     it, args, output) {
+  //     it, args, output, binFile) {
   //   gl.getVertexAttribOffset(
   //       args['index'], args['pname']);
   // },
   'WebGLRenderingContext#hint': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glHint(' + [
       args['target'], args['mode']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#isBuffer': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glIsBuffer(' + [
       'context->GetObject(' + args['buffer'] + ')'
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#isEnabled': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glIsEnabled(' + [
       args['cap']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#isFramebuffer': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glIsFramebuffer(' + [
       'context->GetObject(' + args['framebuffer'] + ')',
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#isProgram': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glIsProgram(' + [
       'context->GetObject(' + args['program'] + ')',
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#isRenderbuffer': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glIsRenderbuffer(' + [
       'context->GetObject(' + args['renderbuffer'] + ')',
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#isShader': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glIsShader(' + [
       'context->GetObject(' + args['shader'] + ')',
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#isTexture': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glIsTexture(' + [
       'context->GetObject(' + args['texture'] + ')',
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#lineWidth': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glLineWidth(' + [
       args['width']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#linkProgram': function(
-      it, args, output) {
+      it, args, output, binFile) {
     // Do all the attribute bindings, then link.
     var attribMap = args['attributes'];
     for (var attribName in attribMap) {
@@ -782,44 +861,44 @@ var CALLS = {
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#pixelStorei': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glPixelStorei(' + [
       args['pname'], args['param']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#polygonOffset': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glPolygonOffset(' + [
       args['factor'], args['units']
     ].join(', ') + ');');
   },
   // 'WebGLRenderingContext#readPixels': function(
-  //     it, args, output) {
+  //     it, args, output, binFile) {
   //   var pixels = new Uint8Array(args['size']);
   //   gl.readPixels(args['x'], args['y'],
   //       args['width'], args['height'], args['format'],
   //       args['type'], pixels);
   // },
   'WebGLRenderingContext#renderbufferStorage': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glRenderbufferStorage(' + [
       args['target'], args['internalformat'], args['width'], args['height']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#sampleCoverage': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glSampleCoverage(' + [
       args['value'], args['invert']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#scissor': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glScissor(' + [
       args['x'], args['y'], args['width'], args['height']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#shaderSource': function(
-      it, args, output) {
+      it, args, output, binFile) {
     var finalSource = args['source'];
     finalSource = finalSource.replace(/\n/g, '\\n');
     finalSource = finalSource.replace(/"/g, '\\"');
@@ -831,43 +910,43 @@ var CALLS = {
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#stencilFunc': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glStencilFunc(' + [
       args['func'], args['ref'], args['mask']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#stencilFuncSeparate': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glStencilFuncSeparate(' + [
       args['face'], args['func'], args['ref'], args['mask']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#stencilMask': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glStencilMask(' + [
       args['mask']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#stencilMaskSeparate': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glStencilMaskSeparate(' + [
       args['face'], args['mask']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#stencilOp': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glStencilOp(' + [
       args['fail'], args['zfail'], args['zpass']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#stencilOpSeparate': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glStencilOpSeparate(' + [
       args['face'], args['fail'], args['zfail'], args['zpass']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#texImage2D': function(
-      it, args, output) {
+      it, args, output, binFile) {
     var dataType = args['dataType'];
     if (dataType == 'pixels') {
       output.push('glTexImage2D(' + [
@@ -879,7 +958,7 @@ var CALLS = {
           args['border'],
           args['format'],
           args['type'],
-          '(const GLvoid*)' + arrayToString(args['pixels'])
+          '(const GLvoid*)' + embedArray(args['pixels'], binFile)
       ].join(', ') + ');');
     } else if (dataType == 'null') {
       output.push('glTexImage2D(' + [
@@ -907,7 +986,7 @@ var CALLS = {
     }
   },
   'WebGLRenderingContext#texSubImage2D': function(
-      it, args, output) {
+      it, args, output, binFile) {
     var dataType = args['dataType'];
     if (dataType == 'pixels') {
       // gl.texSubImage2D(
@@ -930,7 +1009,7 @@ var CALLS = {
         args['height'],
         args['format'],
         args['type'],
-        '(const GLvoid*)' + arrayToString(args['pixels'])
+        '(const GLvoid*)' + embedArray(args['pixels'], binFile)
       ].join(', ') + ');');
     } else if (dataType == 'null') {
       output.push('glTexSubImage2D(' + [
@@ -959,245 +1038,245 @@ var CALLS = {
     }
   },
   'WebGLRenderingContext#texParameterf': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glTexParameterf(' + [
       args['target'], args['pname'], args['param']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#texParameteri': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glTexParameteri(' + [
       args['target'], args['pname'], args['param']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#uniform1f': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glUniform1f(' + [
       'context->GetObject(' + args['location'] + ')',
       args['x']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#uniform1fv': function(
-      it, args, output) {
+      it, args, output, binFile) {
     var v = args['v'];
     output.push('glUniform1fv(' + [
       'context->GetObject(' + args['location'] + ')',
       v.length / 1,
-      arrayToString(v),
+      embedArray(v, binFile),
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#uniform1i': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glUniform1i(' + [
       'context->GetObject(' + args['location'] + ')',
       args['x']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#uniform1iv': function(
-      it, args, output) {
+      it, args, output, binFile) {
     var v = args['v'];
     output.push('glUniform1iv(' + [
       'context->GetObject(' + args['location'] + ')',
       v.length / 1,
-      arrayToString(v)
+      embedArray(v, binFile)
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#uniform2f': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glUniform2f(' + [
       'context->GetObject(' + args['location'] + ')',
       args['x'], args['y']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#uniform2fv': function(
-      it, args, output) {
+      it, args, output, binFile) {
     var v = args['v'];
     output.push('glUniform2fv(' + [
       'context->GetObject(' + args['location'] + ')',
       v.length / 2,
-      arrayToString(v)
+      embedArray(v, binFile)
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#uniform2i': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glUniform2i(' + [
       'context->GetObject(' + args['location'] + ')',
       args['x'], args['y']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#uniform2iv': function(
-      it, args, output) {
+      it, args, output, binFile) {
     var v = args['v'];
     output.push('glUniform2iv(' + [
       'context->GetObject(' + args['location'] + ')',
       v.length / 2,
-      arrayToString(v)
+      embedArray(v, binFile)
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#uniform3f': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glUniform3f(' + [
       'context->GetObject(' + args['location'] + ')',
       args['x'], args['y'], args['z']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#uniform3fv': function(
-      it, args, output) {
+      it, args, output, binFile) {
     var v = args['v'];
     output.push('glUniform3fv(' + [
       'context->GetObject(' + args['location'] + ')',
       v.length / 3,
-      arrayToString(v)
+      embedArray(v, binFile)
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#uniform3i': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glUniform3i(' + [
       'context->GetObject(' + args['location'] + ')',
       args['x'], args['y'], args['z']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#uniform3iv': function(
-      it, args, output) {
+      it, args, output, binFile) {
     var v = args['v'];
     output.push('glUniform3iv(' + [
       'context->GetObject(' + args['location'] + ')',
       v.length / 3,
-      arrayToString(v)
+      embedArray(v, binFile)
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#uniform4f': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glUniform4f(' + [
       'context->GetObject(' + args['location'] + ')',
       args['x'], args['y'], args['z'], args['w']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#uniform4fv': function(
-      it, args, output) {
+      it, args, output, binFile) {
     var v = args['v'];
     output.push('glUniform4fv(' + [
       'context->GetObject(' + args['location'] + ')',
       v.length / 4,
-      arrayToString(v)
+      embedArray(v, binFile)
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#uniform4i': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glUniform4i(' + [
       'context->GetObject(' + args['location'] + ')',
       args['x'], args['y'], args['z'], args['w']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#uniform4iv': function(
-      it, args, output) {
+      it, args, output, binFile) {
     var v = args['v'];
     output.push('glUniform4iv(' + [
       'context->GetObject(' + args['location'] + ')',
       v.length / 4,
-      arrayToString(v)
+      embedArray(v, binFile)
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#uniformMatrix2fv': function(
-      it, args, output) {
+      it, args, output, binFile) {
     var v = args['value'];
     output.push('glUniformMatrix2fv(' + [
       'context->GetObject(' + args['location'] + ')',
       v.length / 4,
       args['transpose'],
-      arrayToString(v)
+      embedArray(v, binFile)
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#uniformMatrix3fv': function(
-      it, args, output) {
+      it, args, output, binFile) {
     var v = args['value'];
     output.push('glUniformMatrix3fv(' + [
       'context->GetObject(' + args['location'] + ')',
       v.length / 9,
       args['transpose'],
-      arrayToString(v)
+      embedArray(v, binFile)
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#uniformMatrix4fv': function(
-      it, args, output) {
+      it, args, output, binFile) {
     var v = args['value'];
     output.push('glUniformMatrix4fv(' + [
       'context->GetObject(' + args['location'] + ')',
       v.length / 16,
       args['transpose'],
-      arrayToString(v)
+      embedArray(v, binFile)
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#useProgram': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glUseProgram(' + [
       'context->GetObject(' + args['program'] + ')',
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#validateProgram': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glValidateProgram(' + [
       'context->GetObject(' + args['program'] + ')',
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#vertexAttrib1fv': function(
-      it, args, output) {
+      it, args, output, binFile) {
     var v = args['values'];
     output.push('glVertexAttrib1fv(' + [
       args['indx'],
-      arrayToString(v)
+      embedArray(v, binFile)
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#vertexAttrib2fv': function(
-      it, args, output) {
+      it, args, output, binFile) {
     var v = args['values'];
     output.push('glVertexAttrib2fv(' + [
       args['indx'],
-      arrayToString(v)
+      embedArray(v, binFile)
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#vertexAttrib3fv': function(
-      it, args, output) {
+      it, args, output, binFile) {
     var v = args['values'];
     output.push('glVertexAttrib3fv(' + [
       args['indx'],
-      arrayToString(v)
+      embedArray(v, binFile)
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#vertexAttrib4fv': function(
-      it, args, output) {
+      it, args, output, binFile) {
     var v = args['values'];
     output.push('glVertexAttrib4fv(' + [
       args['indx'],
-      arrayToString(v)
+      embedArray(v, binFile)
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#vertexAttrib1f': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glVertexAttrib1f(' + [
       args['indx'], args['x']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#vertexAttrib2f': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glVertexAttrib2f(' + [
       args['indx'], args['x'], args['y']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#vertexAttrib3f': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glVertexAttrib3f(' + [
       args['indx'], args['x'], args['y'], args['z']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#vertexAttrib4f': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glVertexAttrib4f(' + [
       args['indx'], args['x'], args['y'], args['z'], args['w']
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#vertexAttribPointer': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glVertexAttribPointer(' + [
       args['indx'],
       args['size'],
@@ -1208,14 +1287,14 @@ var CALLS = {
     ].join(', ') + ');');
   },
   'WebGLRenderingContext#viewport': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glViewport(' + [
       args['x'], args['y'], args['width'], args['height']
     ].join(', ') + ');');
   },
 
   'ANGLEInstancedArrays#drawArraysInstancedANGLE': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glDrawArraysInstanced(' + [
       args['mode'],
       args['first'],
@@ -1224,7 +1303,7 @@ var CALLS = {
     ].join(', ') + ');');
   },
   'ANGLEInstancedArrays#drawElementsInstancedANGLE': function(
-      it, args, output) {
+      it, args, output, binFile) {
     output.push('glDrawElementsInstanced(' + [
       args['mode'],
       args['count'],
@@ -1241,11 +1320,11 @@ var CALLS = {
     ].join(', ') + ');');
   },
 
-  'WebGLRenderingContext#isContextLost': function(it, args, output) {
+  'WebGLRenderingContext#isContextLost': function(it, args, output, binFile) {
     // Ignored.
   },
 
-  'wtf.webgl#createContext': function(it, args, output) {
+  'wtf.webgl#createContext': function(it, args, output, binFile) {
     var attributes = args['attributes'];
     var contextHandle = args['handle'];
 
@@ -1260,7 +1339,7 @@ var CALLS = {
     output.push(
         'context = replay->CreateContext(' + callArgs.join(', ') + ');');
   },
-  'wtf.webgl#setContext': function(it, args, output) {
+  'wtf.webgl#setContext': function(it, args, output, binFile) {
     var contextHandle = args['handle'];
     var width = args['width'];
     var height = args['height'];

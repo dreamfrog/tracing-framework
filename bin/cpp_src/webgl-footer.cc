@@ -1,7 +1,10 @@
 
 int main(int argc, char** argv) {
-  Replay replay(trace_name, steps, _countof(steps));
+  Replay replay(trace_name, bin_name, steps, _countof(steps));
 
-  replay.LoadResources();
+  if (!replay.LoadResources()) {
+    return 1;
+  }
+
   return replay.Run();
 }

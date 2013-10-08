@@ -22,6 +22,8 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+#include <unistd.h>         // readlink
 #include <unordered_map>
 #include <vector>
 
@@ -190,9 +192,10 @@ private:
 
 class Replay {
 public:
-  Replay(const char* trace_name,
+  Replay(const char* trace_name, const char* bin_name,
          const StepFunction* steps, int step_count) :
-      trace_name_(trace_name),
+      trace_name_(trace_name), bin_name_(bin_name),
+      bin_data_(0), bin_data_length_(0),
       steps_(steps), step_count_(step_count), step_index_(0) {
     SDL_Init(SDL_INIT_VIDEO);
 
@@ -206,10 +209,65 @@ public:
       delete *it;
     }
 
+    free(bin_data_);
+
     SDL_Quit();
   }
 
-  void LoadResources() {
+  bool LoadResources() {
+    // Get executable path (without executable name).
+    char file_path[2048];
+    int file_path_size = sizeof(file_path);
+#if defined(WIN32)
+    const char path_sep = '\\';
+    GetModuleFileName(NULL, file_path, file_path_size);
+#elif defined(__APPLE__)
+    const char path_sep = '/';
+    _NSGetExecutablePath(file_path, file_path_size);
+#else
+    const char path_sep = '/';
+    int file_path_length =
+        readlink("/proc/self/exe", file_path, file_path_size - 1);
+    if (file_path_length == -1) {
+      printf("Can't find myself!\n");
+      return 1;
+    }
+    file_path[file_path_length] = 0;
+#endif
+    char* last_slash = strrchr(file_path, path_sep);
+    last_slash++;
+    *last_slash = 0;
+
+    // Open the .bin file.
+    strcat(file_path, bin_name_);
+    FILE* file = fopen(file_path, "r");
+    if (!file) {
+      printf("Unable to open bin file %s\n", bin_name_);
+      return false;
+    }
+
+    fseek(file, 0, SEEK_END);
+    bin_data_length_ = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    bin_data_ = (uint8_t*)malloc(bin_data_length_);
+    if (!bin_data_) {
+      printf("Unable to allocate bin memory\n");
+      return false;
+    }
+
+    fread(bin_data_, 1, bin_data_length_, file);
+
+    fclose(file);
+
+    return true;
+  }
+
+  const void* GetBinData(size_t offset, size_t length) {
+    if (offset + length > bin_data_length_) {
+      return NULL;
+    }
+    return bin_data_ + offset;
   }
 
   int Run() {
@@ -283,9 +341,13 @@ public:
 
 private:
   const char* trace_name_;
+  const char* bin_name_;
   const StepFunction* steps_;
   int   step_count_;
   int   step_index_;
+
+  uint8_t*  bin_data_;
+  size_t    bin_data_length_;
 
   vector<CanvasContext*> contexts_;
   unordered_map<int, CanvasContext*> context_map_;
